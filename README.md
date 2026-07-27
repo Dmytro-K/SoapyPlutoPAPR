@@ -3,8 +3,8 @@
 ## Installation instructions
 
 ```
-git clone https://github.com/pothosware/SoapyPlutoSDR
-cd SoapyPlutoSDR
+git clone https://github.com/F5OEO/SoapyPlutoPAPR
+cd SoapyPlutoPAPR
 mkdir build
 cd build
 cmake ..
