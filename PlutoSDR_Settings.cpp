@@ -1,4 +1,5 @@
 #include "SoapyPlutoSDR.hpp"
+#include "iqnet_proto.h"
 #include <cstring>
 #ifdef HAS_AD9361_IIO
 #include <ad9361.h>
@@ -86,6 +87,118 @@ SoapyPlutoSDR::SoapyPlutoSDR(const SoapySDR::Kwargs &args)
             }
         }
     }
+
+    try
+    {
+        parse_iqnet_args(args);
+    }
+    catch (...)
+    {
+        iio_context_destroy(ctx);
+        ctx = nullptr;
+        throw;
+    }
+}
+
+// Board address for the iqnet control/data connection: the host part of an
+// "ip:<host>[:<port>]" URI, the hostname arg, or the address libiio resolved.
+static std::string iqnet_host_from_uri(const std::string &uri)
+{
+    if (uri.compare(0, 3, "ip:") != 0)
+        return "";
+    std::string host = uri.substr(3);
+    if (!host.empty() && host[0] == '[')
+    {
+        const size_t end = host.find(']');
+        return end == std::string::npos ? "" : host.substr(1, end - 1);
+    }
+    const size_t colon = host.find(':');
+    if (colon != std::string::npos && host.find(':', colon + 1) == std::string::npos)
+        host.resize(colon);  // strip ":port" (more than one ':' = bare IPv6 literal)
+    return host;
+}
+
+// upper bound for tezuka_udp_block_size (one IIO DMA block)
+static constexpr unsigned long IQNET_MAX_BLOCK_SIZE = 16ul << 20;
+
+static unsigned long iqnet_arg_ulong(const SoapySDR::Kwargs &args, const char *key,
+                                     const unsigned long min, const unsigned long max)
+{
+    const std::string &value = args.at(key);
+    unsigned long v = 0;
+    size_t used = 0;
+    try
+    {
+        v = std::stoul(value, &used, 0);
+    }
+    catch (const std::exception &)
+    {
+        used = 0;
+    }
+    if (used == 0 || used != value.size() || v < min || v > max)
+        throw std::runtime_error(std::string("invalid ") + key + "=" + value);
+    return v;
+}
+
+void SoapyPlutoSDR::parse_iqnet_args(const SoapySDR::Kwargs &args)
+{
+    iqnet = IqNetConfig();
+
+    const std::string transport =
+        args.count("tezuka_transport") != 0 ? args.at("tezuka_transport") : "iio";
+    if (transport == "iio")
+        return;
+    if (transport != "udp")
+        throw std::runtime_error("invalid tezuka_transport=" + transport + " (iio or udp)");
+
+    iqnet.enabled = true;
+
+    if (args.count("tezuka_udp_host") != 0)
+        iqnet.host = args.at("tezuka_udp_host");
+    if (iqnet.host.empty() && args.count("uri") != 0)
+        iqnet.host = iqnet_host_from_uri(args.at("uri"));
+    if (iqnet.host.empty() && args.count("hostname") != 0)
+        iqnet.host = args.at("hostname");
+    if (iqnet.host.empty())
+    {
+        const char *ip = iio_context_get_attr_value(ctx, "ip,ip-addr");
+        if (ip != nullptr)
+            iqnet.host = ip;
+    }
+    if (iqnet.host.empty())
+        throw std::runtime_error("tezuka_transport=udp needs a network device: use uri=ip:<host>, "
+                                 "hostname=<host> or tezuka_udp_host=<host>");
+
+    if (args.count("tezuka_udp_port") != 0)
+        iqnet.udp_port = uint16_t(iqnet_arg_ulong(args, "tezuka_udp_port", 1, 65535));
+    if (args.count("tezuka_udp_rcvbuf") != 0)
+        iqnet.rcvbuf = iqnet_arg_ulong(args, "tezuka_udp_rcvbuf", 65536, 1ul << 30);
+
+    // optional START parameters, passed through to the board (it validates them too)
+    static const struct
+    {
+        const char *arg, *key;
+        unsigned long min, max;
+    } start_keys[] = {{"tezuka_udp_blocks", "blocks", 1, IQNET_MAX_BLOCKS},
+                      {"tezuka_udp_block_size", "block_size", 0, 0xFFFFFFFFul},
+                      {"tezuka_udp_gso", "gso", 0, IQNET_MAX_GSO}};
+    for (const auto &k : start_keys)
+    {
+        if (args.count(k.arg) == 0)
+            continue;
+        const unsigned long v = iqnet_arg_ulong(args, k.arg, k.min, k.max);
+        // the block must hold whole datagrams and stay within what the board can allocate
+        if (std::string(k.arg) == "tezuka_udp_block_size" &&
+            (v == 0 || v % IQNET_DEFAULT_PAYLOAD != 0 || v > IQNET_MAX_BLOCK_SIZE))
+            throw std::runtime_error(
+                "invalid tezuka_udp_block_size=" + args.at(k.arg) +
+                ": must be a non-zero multiple of " + std::to_string(IQNET_DEFAULT_PAYLOAD) +
+                " bytes and at most " + std::to_string(IQNET_MAX_BLOCK_SIZE) + " (16 MiB)");
+        iqnet.start_options += std::string(" ") + k.key + "=" + std::to_string(v);
+    }
+
+    SoapySDR_logf(SOAPY_SDR_INFO, "RX transport: UDP from %s, local port %u%s", iqnet.host.c_str(),
+                  (unsigned)iqnet.udp_port, iqnet.start_options.c_str());
 }
 
 SoapyPlutoSDR::~SoapyPlutoSDR(void)

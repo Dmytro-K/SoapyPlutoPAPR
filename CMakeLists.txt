@@ -87,6 +87,7 @@ SOAPY_SDR_MODULE_UTIL(
     PlutoSDR_Registration.cpp
     PlutoSDR_Settings.cpp
     PlutoSDR_Streaming.cpp
+    PlutoSDR_IqNet.cpp
     LIBRARIES ${PLUTOSDR_LIBS}
 )
 

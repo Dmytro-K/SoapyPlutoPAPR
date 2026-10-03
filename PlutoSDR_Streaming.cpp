@@ -12,8 +12,6 @@
 
 static const uint8_t CS12_MAGIC[20] = {0xA1, 0x5C, 0x1E, 0xAB, 0xD2, 0xC5, 0xEF, 0x12, 0x37, 0x9A,
                                        0x4D, 0x6B, 0xE1, 0xF0, 0x8A, 0x3C, 0x56, 0x7D, 0x91, 0x24};
-static constexpr size_t CS12_BURST = 24;                      // 8 IQ samples
-static constexpr uint32_t CS12_BURSTS_PER_SYNC = 262144 / 8;  // must match SYNC_PERIOD_SAMPLES
 
 static inline int16_t sext12(const unsigned v)
 {
@@ -169,9 +167,9 @@ SoapySDR::Stream *SoapyPlutoSDR::setupStream(const int direction, const std::str
         iio_channel_attr_write_bool(iio_device_find_channel(dev, "altvoltage0", true), "powerdown",
                                     false);  // Turn ON RX LO
 
-        this->rx_stream = std::unique_ptr<rx_streamer>(
-            new rx_streamer(rx_dev, streamFormat,
-                            UseExtendedTezukaFeatures ? wire_format : WIRE_CS16, channels, args));
+        this->rx_stream = std::unique_ptr<rx_streamer>(new rx_streamer(
+            rx_dev, streamFormat, UseExtendedTezukaFeatures ? wire_format : WIRE_CS16, channels,
+            args, iqnet));
 
         return reinterpret_cast<SoapySDR::Stream *>(this->rx_stream.get());
     }
@@ -339,6 +337,8 @@ int SoapyPlutoSDR::readStreamStatus(SoapySDR::Stream *stream, size_t &chanMask, 
 
 void rx_streamer::set_buffer_size_by_samplerate(const size_t samplerate)
 {
+    if (udp)
+        return;  // no IIO buffer on the host side, MTU is fixed by the datagram batch
 
 #define MAX_BUFF_SIZE 32000000LL
 #define MAX_TOTAL_SIZE 24000000LL
@@ -377,7 +377,7 @@ void rx_streamer::set_mtu_size(const size_t mtu_size)
 
 rx_streamer::rx_streamer(const iio_device *_dev, const plutosdrStreamFormat _format,
                          const WireFormat _wire_format, const std::vector<size_t> &channels,
-                         const SoapySDR::Kwargs &args)
+                         const SoapySDR::Kwargs &args, const IqNetConfig &net)
     : dev(_dev), buffer_size(DEFAULT_RX_BUFFER_SIZE), buf(nullptr), format(_format),
       wire_format(_wire_format), mtu_size(DEFAULT_RX_BUFFER_SIZE)
 
@@ -422,7 +422,13 @@ rx_streamer::rx_streamer(const iio_device *_dev, const plutosdrStreamFormat _for
         }
     }
 
-    if (args.count("bufflen") != 0)
+    if (net.enabled)
+    {
+        // the board's iqnet service owns the IIO buffer: do not create one here
+        udp_open(net);
+        set_mtu_size(udp_mtu());
+    }
+    else if (args.count("bufflen") != 0)
     {
 
         try
@@ -449,6 +455,9 @@ rx_streamer::rx_streamer(const iio_device *_dev, const plutosdrStreamFormat _for
 
 rx_streamer::~rx_streamer()
 {
+    if (udp)
+        udp_stop();
+
     if (buf)
     {
         iio_buffer_cancel(buf);
@@ -570,6 +579,12 @@ size_t rx_streamer::recv_cs12(void *const *buffs, const size_t numElems)
         return SOAPY_SDR_OVERFLOW;  // decoded data stays queued for the next call
     }
 
+    return output_iq(buffs[0], numElems);
+}
+
+// copy up to numElems decoded CS12 IQ pairs from the iq queue to dst (host format)
+size_t rx_streamer::output_iq(void *dst, const size_t numElems)
+{
     const size_t n = std::min(numElems, iq.size() / 2 - iq_pos);
     const int16_t *s = iq.data() + iq_pos * 2;
 
@@ -577,32 +592,32 @@ size_t rx_streamer::recv_cs12(void *const *buffs, const size_t numElems)
     {
         case PLUTO_SDR_CF32:
         case PLUTO_SDR_CF32_TEZUKA: {
-            float *dst = (float *)buffs[0];
+            float *out = (float *)dst;
             for (size_t k = 0; k < n * 2; k++)
-                dst[k] = float(s[k]) / 2048.0f;
+                out[k] = float(s[k]) / 2048.0f;
             break;
         }
         case PLUTO_SDR_CS16:
         case PLUTO_SDR_CS16_TEZUKA:
-            ::memcpy(buffs[0], s, n * 2 * sizeof(int16_t));
+            ::memcpy(dst, s, n * 2 * sizeof(int16_t));
             break;
         case PLUTO_SDR_CS8:
         case PLUTO_SDR_CS8_TEZUKA: {
-            int8_t *dst = (int8_t *)buffs[0];
+            int8_t *out = (int8_t *)dst;
             for (size_t k = 0; k < n * 2; k++)
-                dst[k] = int8_t(s[k] >> 4);
+                out[k] = int8_t(s[k] >> 4);
             break;
         }
         case PLUTO_SDR_CS12:
         case PLUTO_SDR_CS12_TEZUKA: {
-            uint8_t *dst = (uint8_t *)buffs[0];
+            uint8_t *out = (uint8_t *)dst;
             for (size_t k = 0; k < n; k++)
             {
                 const int16_t i = s[2 * k];
                 const int16_t q = s[2 * k + 1];
-                *dst++ = uint8_t(i);
-                *dst++ = uint8_t((q << 4) | ((i >> 8) & 0x0f));
-                *dst++ = uint8_t(q >> 4);
+                *out++ = uint8_t(i);
+                *out++ = uint8_t((q << 4) | ((i >> 8) & 0x0f));
+                *out++ = uint8_t(q >> 4);
             }
             break;
         }
@@ -610,6 +625,108 @@ size_t rx_streamer::recv_cs12(void *const *buffs, const size_t numElems)
 
     iq_pos += n;
     return n;
+}
+
+// Convert `items` raw wire items at src to the host format at dst.
+// Wire CS16 (I+Q enabled, plain formats): int16 I, int16 Q, 12 bit LSB aligned.
+// Wire CS8 (I only, *_TEZUKA formats): int8 I, int8 Q.
+void rx_streamer::convert_direct(const uint8_t *src, void *dst, const size_t items)
+{
+    // optimize for single RX, 2 channel (I/Q), same endianess direct copy
+    // note that RX is 12 bits LSB aligned, i.e. fullscale 2048
+    int16_t const *src_ptr = (const int16_t *)src;
+
+    if (format == PLUTO_SDR_CS16)
+    {
+
+        ::memcpy(dst, src_ptr, 2 * sizeof(int16_t) * items);
+    }
+    else if (format == PLUTO_SDR_CF32)
+    {
+
+        float *dst_cf32 = (float *)dst;
+
+        for (size_t index = 0; index < items * 2; ++index)
+        {
+            *dst_cf32 = float(*src_ptr) / 2048.0f;
+            src_ptr++;
+            dst_cf32++;
+        }
+    }
+    else if (format == PLUTO_SDR_CS12)
+    {
+
+        int8_t *dst_cs12 = (int8_t *)dst;
+
+        for (size_t index = 0; index < items; ++index)
+        {
+            int16_t i = *src_ptr++;
+            int16_t q = *src_ptr++;
+            // produce 24 bit (iiqIQQ), note the input is LSB aligned, scale=2048
+            // note: byte0 = i[7:0]; byte1 = {q[3:0], i[11:8]}; byte2 = q[11:4];
+            *dst_cs12++ = uint8_t(i);
+            *dst_cs12++ = uint8_t((q << 4) | ((i >> 8) & 0x0f));
+            *dst_cs12++ = uint8_t(q >> 4);
+        }
+    }
+    else if (format == PLUTO_SDR_CS8)
+    {
+
+        int8_t *dst_cs8 = (int8_t *)dst;
+
+        for (size_t index = 0; index < items * 2; index++)
+        {
+            *dst_cs8 = int8_t(*src_ptr >> 4);
+            src_ptr++;
+            dst_cs8++;
+        }
+    }
+    else if (format == PLUTO_SDR_CS16_TEZUKA)
+    {
+
+        int16_t *dst_cs16 = (int16_t *)dst;
+        int8_t const *src_ptr_i8 = (const int8_t *)src;
+        for (size_t index = 0; index < items * 2; ++index)
+        {
+            *dst_cs16 = int16_t(*(src_ptr_i8)) << 8;
+
+            src_ptr_i8++;
+            dst_cs16++;
+        }
+    }
+    else if (format == PLUTO_SDR_CF32_TEZUKA)
+    {
+
+        float *dst_cf32 = (float *)dst;
+        int8_t const *src_ptr_i8 = (const int8_t *)src;
+        for (size_t index = 0; index < items * 2; ++index)
+        {
+            *dst_cf32 = float(*(src_ptr_i8)) / 128.0f;
+
+            src_ptr_i8++;
+            dst_cf32++;
+        }
+    }
+    else if (format == PLUTO_SDR_CS12_TEZUKA)
+    {
+        // wire CS8: one item is int8 I, int8 Q (2 bytes). Scale to 12 bits.
+        uint8_t *dst_cs12 = (uint8_t *)dst;
+        int8_t const *src_ptr_i8 = (const int8_t *)src;
+
+        for (size_t index = 0; index < items; ++index)
+        {
+            const int16_t i = int16_t(*src_ptr_i8++ * 16);
+            const int16_t q = int16_t(*src_ptr_i8++ * 16);
+            // note: byte0 = i[7:0]; byte1 = {q[3:0], i[11:8]}; byte2 = q[11:4];
+            *dst_cs12++ = uint8_t(i);
+            *dst_cs12++ = uint8_t((q << 4) | ((i >> 8) & 0x0f));
+            *dst_cs12++ = uint8_t(q >> 4);
+        }
+    }
+    else if (format == PLUTO_SDR_CS8_TEZUKA)
+    {
+        ::memcpy(dst, src_ptr, 2 * sizeof(int8_t) * items);
+    }
 }
 
 void rx_streamer::reset_cs12()
@@ -625,6 +742,9 @@ void rx_streamer::reset_cs12()
 size_t rx_streamer::recv(void *const *buffs, const size_t numElems, int &flags, long long &timeNs,
                          const long timeoutUs)
 {
+    if (udp)
+        return size_t(udp_recv(buffs, numElems, timeoutUs));
+
     if (wire_format == WIRE_CS12)
     {
         return recv_cs12(buffs, numElems);
@@ -664,108 +784,7 @@ size_t rx_streamer::recv(void *const *buffs, const size_t numElems, int &flags, 
 
     if (direct_copy)
     {
-        // optimize for single RX, 2 channel (I/Q), same endianess direct copy
-        // note that RX is 12 bits LSB aligned, i.e. fullscale 2048
-        uint8_t *src = (uint8_t *)iio_buffer_start(buf) + byte_offset;
-        int16_t const *src_ptr = (int16_t *)src;
-
-        if (format == PLUTO_SDR_CS16)
-        {
-
-            ::memcpy(buffs[0], src_ptr, 2 * sizeof(int16_t) * items);
-        }
-        else if (format == PLUTO_SDR_CF32)
-        {
-
-            float *dst_cf32 = (float *)buffs[0];
-
-            for (size_t index = 0; index < items * 2; ++index)
-            {
-                *dst_cf32 = float(*src_ptr) / 2048.0f;
-                src_ptr++;
-                dst_cf32++;
-            }
-        }
-        else if (format == PLUTO_SDR_CS12)
-        {
-
-            int8_t *dst_cs12 = (int8_t *)buffs[0];
-
-            for (size_t index = 0; index < items; ++index)
-            {
-                int16_t i = *src_ptr++;
-                int16_t q = *src_ptr++;
-                // produce 24 bit (iiqIQQ), note the input is LSB aligned, scale=2048
-                // note: byte0 = i[7:0]; byte1 = {q[3:0], i[11:8]}; byte2 = q[11:4];
-                *dst_cs12++ = uint8_t(i);
-                *dst_cs12++ = uint8_t((q << 4) | ((i >> 8) & 0x0f));
-                *dst_cs12++ = uint8_t(q >> 4);
-            }
-        }
-        else if (format == PLUTO_SDR_CS8)
-        {
-
-            int8_t *dst_cs8 = (int8_t *)buffs[0];
-
-            for (size_t index = 0; index < items * 2; index++)
-            {
-                *dst_cs8 = int8_t(*src_ptr >> 4);
-                src_ptr++;
-                dst_cs8++;
-            }
-        }
-        else if (format == PLUTO_SDR_CS16_TEZUKA)
-        {
-
-            //::memcpy(buffs[0], src_ptr, 2 * sizeof(int16_t) * items);
-            int16_t *dst_cs16 = (int16_t *)buffs[0];
-            int8_t const *src_ptr_i8 = (int8_t *)src;
-            for (size_t index = 0; index < items * 2; ++index)
-            {
-                //*dst_cf32 = float(*src_ptr) / 2048.0f;
-                *dst_cs16 = int16_t(*(src_ptr_i8)) << 8;
-
-                src_ptr_i8++;
-                dst_cs16++;
-            }
-        }
-        else if (format == PLUTO_SDR_CF32_TEZUKA)
-        {
-
-            float *dst_cf32 = (float *)buffs[0];
-            int8_t const *src_ptr_i8 = (int8_t *)src;
-            for (size_t index = 0; index < items * 2; ++index)
-            {
-                //*dst_cf32 = float(*src_ptr) / 2048.0f;
-                *dst_cf32 = float(*(src_ptr_i8)) / 128.0f;
-
-                src_ptr_i8++;
-                dst_cf32++;
-            }
-        }
-        else if (format == PLUTO_SDR_CS12_TEZUKA)
-        {
-
-            int8_t *dst_cs12 = (int8_t *)buffs[0];
-
-            for (size_t index = 0; index < items; ++index)
-            {
-                int16_t i = *src_ptr++;
-                int16_t q = *src_ptr++;
-                // produce 24 bit (iiqIQQ), note the input is LSB aligned, scale=2048
-                // note: byte0 = i[7:0]; byte1 = {q[3:0], i[11:8]}; byte2 = q[11:4];
-                *dst_cs12++ = uint8_t(i);
-                *dst_cs12++ = uint8_t((q << 4) | ((i >> 8) & 0x0f));
-                *dst_cs12++ = uint8_t(q >> 4);
-            }
-        }
-        else if (format == PLUTO_SDR_CS8_TEZUKA)
-        {
-            {
-
-                ::memcpy(buffs[0], src_ptr, 2 * sizeof(int8_t) * items);
-            }
-        }
+        convert_direct((const uint8_t *)iio_buffer_start(buf) + byte_offset, buffs[0], items);
     }
     else
     {
@@ -839,6 +858,9 @@ int rx_streamer::start(const int flags, const long long timeNs, const size_t num
     // force proper stop before
     stop(flags, timeNs);
 
+    if (udp)
+        return udp_start();
+
     // re-create buffer
     buf = iio_device_create_buffer(dev, buffer_size, false);
 
@@ -857,6 +879,9 @@ int rx_streamer::start(const int flags, const long long timeNs, const size_t num
 
 int rx_streamer::stop(const int flags, const long long timeNs)
 {
+    if (udp)
+        udp_stop();
+
     // cancel first
     if (buf)
     {

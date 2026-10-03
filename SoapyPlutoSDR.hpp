@@ -4,8 +4,11 @@
 #include <SoapySDR/Types.hpp>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <iio.h>
+#include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -28,12 +31,28 @@ typedef enum WireFormat
     WIRE_CS12
 } WireFormat;
 
+// CS12 wire format (Tezuka PL packing, see cs12_cs8mux.v / cs12_sync_frame.v)
+static constexpr size_t CS12_BURST = 24;                      // 8 IQ samples
+static constexpr uint32_t CS12_BURSTS_PER_SYNC = 262144 / 8;  // must match SYNC_PERIOD_SAMPLES
+
+// RX data transport, device arg tezuka_transport=iio|udp.
+// udp: IQ data comes from the board's iqnet service (zero-copy UDP, see
+// iqnet_proto.h) instead of an IIO buffer; AD9361 control stays on libiio.
+struct IqNetConfig
+{
+    bool enabled = false;       // tezuka_transport=udp
+    std::string host;           // board IPv4 address or hostname (control + UDP source)
+    uint16_t udp_port = 30432;  // tezuka_udp_port: local UDP port the board sends to
+    size_t rcvbuf = 32 << 20;   // tezuka_udp_rcvbuf: requested SO_RCVBUF, bytes
+    std::string start_options;  // " blocks=.. block_size=.. gso=.." appended to START
+};
+
 class rx_streamer
 {
 public:
     rx_streamer(const iio_device *dev, const plutosdrStreamFormat format,
                 const WireFormat wire_format, const std::vector<size_t> &channels,
-                const SoapySDR::Kwargs &args);
+                const SoapySDR::Kwargs &args, const IqNetConfig &net = IqNetConfig());
     ~rx_streamer();
     size_t recv(void *const *buffs, const size_t numElems, int &flags, long long &timeNs,
                 const long timeoutUs = 100000);
@@ -69,6 +88,25 @@ private:
     void decode_cs12(const uint8_t *d, const size_t len);
     void decode_cs12_burst(const uint8_t *b);
     void reset_cs12();
+    size_t output_iq(void *dst, const size_t numElems);
+
+    // wire CS16/CS8 items -> host format (shared by the IIO and UDP paths)
+    void convert_direct(const uint8_t *src, void *dst, const size_t items);
+
+    // UDP transport (PlutoSDR_IqNet.cpp)
+    struct UdpRx;
+    struct UdpRxDeleter
+    {
+        void operator()(UdpRx *p) const;
+    };
+    std::unique_ptr<UdpRx, UdpRxDeleter> udp;
+    void udp_open(const IqNetConfig &net);
+    int udp_start();
+    void udp_stop();
+    int udp_recv(void *const *buffs, const size_t numElems, const long timeoutUs);
+    int udp_fill(const long long waitUs);
+    void udp_gap_cs12(const uint8_t *&data, size_t &len, const uint64_t lost, const bool restart);
+    size_t udp_mtu() const;
 
     std::vector<int16_t> iq;     // decoded I,Q,I,Q...
     size_t iq_pos = 0;           // read position, in IQ pairs
@@ -301,6 +339,7 @@ private:
     double double_from_buf(const char *buf) const;
     double get_sensor_value(struct iio_channel *chn) const;
     std::string id_to_unit(const std::string &id) const;
+    void parse_iqnet_args(const SoapySDR::Kwargs &args);
 
     iio_device *dev;
     iio_device *rx_dev;
@@ -315,4 +354,5 @@ private:
     std::unique_ptr<tx_streamer> tx_stream;
     bool UseExtendedTezukaFeatures = false;
     WireFormat wire_format = WIRE_CS16;
+    IqNetConfig iqnet;
 };
