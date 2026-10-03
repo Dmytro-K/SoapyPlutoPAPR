@@ -174,6 +174,28 @@ void SoapyPlutoSDR::parse_iqnet_args(const SoapySDR::Kwargs &args)
     if (args.count("tezuka_udp_rcvbuf") != 0)
         iqnet.rcvbuf = iqnet_arg_ulong(args, "tezuka_udp_rcvbuf", 65536, 1ul << 30);
 
+    const std::string path =
+        args.count("tezuka_udp_path") != 0 ? args.at("tezuka_udp_path") : "kernel";
+    if (path != "kernel" && path != "pl")
+        throw std::runtime_error("invalid tezuka_udp_path=" + path + " (kernel or pl)");
+    iqnet.pl = path == "pl";
+
+    // payload: whole CS12 bursts; path=kernel is limited to MTU 1500, path=pl allows jumbo
+    const unsigned long max_payload = iqnet.pl ? IQNET_MAX_PAYLOAD : IQNET_STD_PAYLOAD;
+    if (args.count("tezuka_udp_payload") != 0)
+    {
+        const unsigned long v =
+            iqnet_arg_ulong(args, "tezuka_udp_payload", IQNET_BURST, 0xFFFFFFFFul);
+        if (v % IQNET_BURST != 0 || v > max_payload)
+            throw std::runtime_error(
+                "invalid tezuka_udp_payload=" + args.at("tezuka_udp_payload") +
+                ": must be a multiple of " + std::to_string(IQNET_BURST) + " between " +
+                std::to_string(IQNET_BURST) + " and " + std::to_string(max_payload) +
+                " for tezuka_udp_path=" + path);
+        iqnet.payload = v;
+    }
+    const unsigned long payload = iqnet.payload != 0 ? iqnet.payload : IQNET_DEFAULT_PAYLOAD;
+
     // optional START parameters, passed through to the board (it validates them too)
     static const struct
     {
@@ -186,19 +208,27 @@ void SoapyPlutoSDR::parse_iqnet_args(const SoapySDR::Kwargs &args)
     {
         if (args.count(k.arg) == 0)
             continue;
+        // IIO DMA block settings of iqnet.ko: the board answers ERR to them with path=pl,
+        // so fail here, at open time, instead of on activateStream()
+        if (iqnet.pl)
+            throw std::runtime_error(std::string(k.arg) +
+                                     " applies to tezuka_udp_path=kernel only, not to "
+                                     "tezuka_udp_path=pl");
         const unsigned long v = iqnet_arg_ulong(args, k.arg, k.min, k.max);
         // the block must hold whole datagrams and stay within what the board can allocate
         if (std::string(k.arg) == "tezuka_udp_block_size" &&
-            (v == 0 || v % IQNET_DEFAULT_PAYLOAD != 0 || v > IQNET_MAX_BLOCK_SIZE))
-            throw std::runtime_error(
-                "invalid tezuka_udp_block_size=" + args.at(k.arg) +
-                ": must be a non-zero multiple of " + std::to_string(IQNET_DEFAULT_PAYLOAD) +
-                " bytes and at most " + std::to_string(IQNET_MAX_BLOCK_SIZE) + " (16 MiB)");
+            (v == 0 || v % payload != 0 || v > IQNET_MAX_BLOCK_SIZE))
+            throw std::runtime_error("invalid tezuka_udp_block_size=" + args.at(k.arg) +
+                                     ": must be a non-zero multiple of the payload (" +
+                                     std::to_string(payload) + " bytes) and at most " +
+                                     std::to_string(IQNET_MAX_BLOCK_SIZE) + " (16 MiB)");
         iqnet.start_options += std::string(" ") + k.key + "=" + std::to_string(v);
     }
 
-    SoapySDR_logf(SOAPY_SDR_INFO, "RX transport: UDP from %s, local port %u%s", iqnet.host.c_str(),
-                  (unsigned)iqnet.udp_port, iqnet.start_options.c_str());
+    SoapySDR_logf(SOAPY_SDR_INFO,
+                  "RX transport: UDP from %s, local port %u, path=%s payload=%lu%s",
+                  iqnet.host.c_str(), (unsigned)iqnet.udp_port, path.c_str(), payload,
+                  iqnet.start_options.c_str());
 }
 
 SoapyPlutoSDR::~SoapyPlutoSDR(void)

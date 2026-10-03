@@ -4,7 +4,9 @@
 // as the PL wrote them) as UDP datagrams to this host, see iqnet_proto.h:
 //   [struct iqnet_hdr: magic, seq, u64 stream offset][payload, multiple of 24 bytes]
 // A TCP connection to IQNET_CTRL_PORT starts the stream (START), stops it (STOP,
-// or by closing it) and reports board statistics (STATS).
+// or by closing it) and reports board statistics (STATS). With tezuka_udp_path=pl the
+// board's PL streamer sends the same datagrams instead of iqnet.ko, with payloads up to
+// IQNET_MAX_PAYLOAD (jumbo frames); the START reply gives the actual payload_len.
 //
 // Loss handling: the stream offset in every header tells exactly how many bytes
 // were lost. Datagrams lost in the network or the socket buffer show up as a seq
@@ -54,7 +56,9 @@ namespace
 typedef std::chrono::steady_clock clk;
 
 constexpr unsigned UDP_BATCH = 64;  // datagrams per recvmmsg()
-constexpr size_t UDP_SLOT = 2048;   // > IQNET_HDR_LEN + IQNET_MAX_PAYLOAD, bigger = MSG_TRUNC
+// one receive slot holds the largest datagram of either path (jumbo with path=pl), rounded
+// up to a cache line; anything bigger arrives with MSG_TRUNC and is rejected
+constexpr size_t UDP_SLOT = (IQNET_HDR_LEN + IQNET_MAX_PAYLOAD + 63) & ~size_t(63);
 constexpr int CTRL_CONNECT_MS = 3000;
 constexpr int CTRL_START_MS = 10000;  // the board allocates and enables the IIO DMA blocks
 constexpr int CTRL_STOP_MS = 12000;   // STOP returns after every in-flight block is back
@@ -73,6 +77,12 @@ struct udp_mmsg
     unsigned int msg_len;
 };
 #endif
+
+// datagram payload the board is asked for (and assumed before the START reply)
+size_t requested_payload(const IqNetConfig &cfg)
+{
+    return cfg.payload != 0 ? cfg.payload : size_t(IQNET_DEFAULT_PAYLOAD);
+}
 
 uint32_t get_le32(const uint8_t *p)
 {
@@ -454,8 +464,10 @@ void rx_streamer::udp_open(const IqNetConfig &net)
 
 size_t rx_streamer::udp_mtu() const
 {
-    // samples in one full recvmmsg() batch of default-size datagrams
-    const size_t bytes = size_t(UDP_BATCH) * IQNET_DEFAULT_PAYLOAD;
+    // samples in one full recvmmsg() batch of full-size datagrams (the START reply's
+    // payload_len once streaming, the requested payload before)
+    const size_t payload = udp->payload_len != 0 ? udp->payload_len : requested_payload(udp->cfg);
+    const size_t bytes = size_t(UDP_BATCH) * payload;
     if (wire_format == WIRE_CS12)
         return bytes / CS12_BURST * 8;
     return bytes / (wire_format == WIRE_CS8 ? 2 : 4);
@@ -479,8 +491,17 @@ int rx_streamer::udp_start()
         return SOAPY_SDR_STREAM_ERROR;
     }
 
-    const std::string cmd = "START " + std::to_string(u.cfg.udp_port) + " " +
-                            wire_mode(wire_format) + u.cfg.start_options + "\n";
+    // path= and payload= only when they differ from the board defaults, so a default
+    // request is the same START line the board accepted before the PL path existed
+    const size_t want_payload = requested_payload(u.cfg);
+    std::string opts;
+    if (u.cfg.pl)
+        opts += " path=pl";
+    if (want_payload != IQNET_DEFAULT_PAYLOAD)
+        opts += " payload=" + std::to_string(want_payload);
+    opts += u.cfg.start_options;
+    const std::string cmd =
+        "START " + std::to_string(u.cfg.udp_port) + " " + wire_mode(wire_format) + opts + "\n";
     std::string reply;
     if (!send_all(u.ctrl_fd, cmd) || !u.read_line(CTRL_START_MS, reply))
     {
@@ -500,14 +521,25 @@ int rx_streamer::udp_start()
         return SOAPY_SDR_STREAM_ERROR;
     }
 
+    // the reply is authoritative for the datagram size; block_size is 0 for path=pl
+    if (payload_len != want_payload)
+        SoapySDR_logf(SOAPY_SDR_WARNING, "iqnet: requested %lu B/datagram, the board sends %lu",
+                      (unsigned long)want_payload, payload_len);
     u.payload_len = payload_len;
     u.block_size = block_size;
     u.started = true;
 
-    SoapySDR_logf(SOAPY_SDR_INFO,
-                  "iqnet: streaming %s from %s to UDP port %u, %lu B/datagram, %lu B/block",
-                  wire_mode(wire_format), addr_str(u.board).c_str(), (unsigned)u.cfg.udp_port,
-                  payload_len, block_size);
+    if (u.cfg.pl)
+        SoapySDR_logf(SOAPY_SDR_INFO,
+                      "iqnet: streaming %s from the PL streamer of %s to UDP port %u, "
+                      "%lu B/datagram",
+                      wire_mode(wire_format), addr_str(u.board).c_str(), (unsigned)u.cfg.udp_port,
+                      payload_len);
+    else
+        SoapySDR_logf(SOAPY_SDR_INFO,
+                      "iqnet: streaming %s from %s to UDP port %u, %lu B/datagram, %lu B/block",
+                      wire_mode(wire_format), addr_str(u.board).c_str(), (unsigned)u.cfg.udp_port,
+                      payload_len, block_size);
     return 0;
 }
 
@@ -523,7 +555,7 @@ void rx_streamer::udp_stop()
         if (send_all(u.ctrl_fd, "STATS\n") && u.read_line(CTRL_STATS_MS, line))
         {
             SoapySDR_logf(SOAPY_SDR_INFO, "iqnet board: %s", line.c_str());
-            unsigned long long ovf = 0, shrt = 0, serr = 0;
+            unsigned long long ovf = 0, shrt = 0, serr = 0, ldrop = 0;
             const bool h_ovf = stats_value(line, "overflows", ovf);
             const bool h_shrt = stats_value(line, "short_blocks", shrt);
             const bool h_serr = stats_value(line, "send_errors", serr);
@@ -532,6 +564,10 @@ void rx_streamer::udp_stop()
                               "iqnet board lost data: overflows=%llu short_blocks=%llu "
                               "send_errors=%llu",
                               ovf, shrt, serr);
+            // path=pl: Linux frames the PL streamer dropped while it owned the MAC (a defect)
+            if (stats_value(line, "linux_drops", ldrop) && ldrop != 0)
+                SoapySDR_logf(SOAPY_SDR_WARNING,
+                              "iqnet board: PL streamer dropped %llu Linux frames", ldrop);
         }
         if (!send_all(u.ctrl_fd, "STOP\n") || !u.read_line(CTRL_STOP_MS, line) ||
             line.compare(0, 2, "OK") != 0)
@@ -638,7 +674,9 @@ int rx_streamer::udp_fill(const long long waitUs)
             continue;
         }
         const size_t plen = len - IQNET_HDR_LEN;
-        if (plen == 0 || plen % IQNET_BURST != 0 || plen > IQNET_MAX_PAYLOAD)
+        // never longer than the payload_len of the START reply (path=kernel may send a
+        // shorter last datagram of a short block)
+        if (plen == 0 || plen % IQNET_BURST != 0 || plen > u.payload_len)
         {
             u.bad++;
             continue;

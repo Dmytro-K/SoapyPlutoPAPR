@@ -44,6 +44,8 @@ struct IqNetConfig
     std::string host;           // board IPv4 address or hostname (control + UDP source)
     uint16_t udp_port = 30432;  // tezuka_udp_port: local UDP port the board sends to
     size_t rcvbuf = 32 << 20;   // tezuka_udp_rcvbuf: requested SO_RCVBUF, bytes
+    bool pl = false;            // tezuka_udp_path=pl: the board's PL streamer instead of iqnet.ko
+    size_t payload = 0;         // tezuka_udp_payload: bytes per datagram, 0 = board default
     std::string start_options;  // " blocks=.. block_size=.. gso=.." appended to START
 };
 
